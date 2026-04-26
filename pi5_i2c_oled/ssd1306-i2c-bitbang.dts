@@ -1,0 +1,115 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Device Tree Overlay — Custom Bit-Banged I2C SSD1306 OLED on Raspberry Pi 5 (RP1)
+ * ==================================================================================
+ *
+ * Driver file  : i2c_bitbang_kernel_driver.c
+ * Driver model : Direct ioremap access to RP1 peripheral registers (no gpiod /
+ *                Linux GPIO subsystem). The driver configures FUNCSEL and RIO
+ *                registers itself inside ModuleInit(). This overlay exists to:
+ *
+ *   1. RESERVE the GPIO lines via gpio-hog before any module loads,
+ *      preventing the kernel from handing them to another driver.
+ *   2. DOCUMENT which header pins are wired to the SSD1306 OLED.
+ *
+ * GPIO assignments (RP1 / BCM numbering — same numbering used by gpiochip4):
+ * ---------------------------------------------------------------------------
+ *   GPIO 23  → SCL  (I2C Serial Clock)  — I2C_SCL_PIN   (Pin 16)
+ *   GPIO 24  → SDA  (I2C Serial Data)   — I2C_SDA_PIN   (Pin 18)
+ *
+ * Physical 40-pin header positions:
+ *   GPIO 23  → Pin 16    GPIO 24  → Pin 18
+ *
+ * gpio-hog strategy:
+ * ------------------
+ *   Our driver is ioremap-based and is NOT a platform_driver, so a consumer
+ *   device with pinctrl-0 would never be probed and pinctrl would not apply.
+ *   gpio-hog nodes are processed by the GPIO core immediately when the GPIO
+ *   controller registers — no matching driver needed. Each hog claims the pin
+ *   from the RP1 pool and drives it to a safe idle state at boot.
+ *   ModuleInit() then takes over the lines via direct RIO register writes.
+ *
+ * I2C bus idle-state convention:
+ * --------------------------------
+ *   SCL and SDA are idle-HIGH on an I2C bus (both lines released to pull-ups).
+ *   The gpio-hog nodes below drive them HIGH via output-high so that the
+ *   kernel's GPIO view is correct even before our module loads. Our driver
+ *   then toggles OE (output-enable) to emulate open-drain behaviour:
+ *     - Assert LOW  → set pin as output (RIO OUT pre-loaded to 0)
+ *     - Release HIGH → set pin as input  (pull-up takes over)
+ *
+ * Installation:
+ *   dtc -@ -I dts -O dtb -o ssd1306-i2c-bitbang.dtbo ssd1306-i2c-bitbang.dts
+ *   sudo cp ssd1306-i2c-bitbang.dtbo /boot/firmware/overlays/
+ *   # Add the following to /boot/firmware/config.txt:
+ *   dtoverlay=ssd1306-i2c-bitbang
+ *
+ * Verify (after reboot):
+ *   gpioinfo gpiochip | grep ssd1306   ← expect 2 lines (SCL + SDA)
+ *
+ * No hardware I2C / SPI / UART config.txt changes needed.
+ * These pins are free by default on any standard Pi 5 image.
+ */
+
+/ {
+    /* Restrict overlay to Raspberry Pi 5 only */
+    compatible = "raspberrypi,5-model-b", "brcm,bcm2712";
+
+    /*
+     * Single fragment targeting the RP1 GPIO controller.
+     *
+     * Merging pinctrl group + gpio-hog nodes into ONE fragment ensures the
+     * overlay loader applies them as an atomic unit — eliminating any risk
+     * of double-registration that arises when two fragments share a target.
+     */
+    fragment@0 {
+        target = <&rp1_gpio>;
+        __overlay__ {
+
+            /* ----------------------------------------------------------------
+             * Pinctrl group: defines the mux and bias for both I2C pins.
+             * 'function = "gpio"' selects RP1 SIO mode (FUNCSEL = 5).
+             * 'bias-disable' disables internal pulls — external resistors
+             * handle SCL and SDA (no RST pin on 4-pin I2C modules).
+             * ---------------------------------------------------------------- */
+            ssd1306_i2c_pins: ssd1306_i2c_pins {
+
+                /* SCL, SDA — open-drain lines; pull-ups are external (4.7 kΩ) */
+                bus_pins {
+                    pins = "gpio23",   /* SCL — Pin 16 */
+                           "gpio24";   /* SDA — Pin 18 */
+                    function = "gpio"; /* RP1 SIO mode (FUNCSEL = 5) */
+                    bias-disable;      /* External pull-ups only — no internal pull */
+                };
+            };
+
+            /* ----------------------------------------------------------------
+             * gpio-hog nodes: claim and drive each pin at boot.
+             *
+             * Idle states:
+             *   SCL  idle HIGH (open-drain bus release — external pull-up holds line)
+             *   SDA  idle HIGH (open-drain bus release — external pull-up holds line)
+             * ---------------------------------------------------------------- */
+
+            /* GPIO 23 — SCL (idle HIGH = bus released) */
+            scl_hog: scl_hog {
+                gpio-hog;
+                gpios = <23 0>;
+                output-high;
+                line-name = "ssd1306-scl";
+            };
+
+            /* GPIO 24 — SDA (idle HIGH = bus released) */
+            sda_hog: sda_hog {
+                gpio-hog;
+                gpios = <24 0>;
+                output-high;
+                line-name = "ssd1306-sda";
+            };
+
+        }; /* __overlay__ */
+    }; /* fragment@0 */
+
+}; /* / */

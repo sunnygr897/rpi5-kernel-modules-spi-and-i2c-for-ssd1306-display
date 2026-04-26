@@ -1,0 +1,153 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Device Tree Overlay — Custom Bit-Banged SPI SSD1306 on Raspberry Pi 5 (RP1)
+ * =============================================================================
+ *
+ * Driver file  : spi_bitbang_kernel_driver.c
+ * Driver model : Direct ioremap access to RP1 peripheral registers (no gpiod /
+ *                Linux GPIO subsystem). The driver configures FUNCSEL and RIO
+ *                registers itself inside ModuleInit(). This overlay exists to:
+ *
+ *   1. RESERVE the five GPIO lines via gpio-hog before any module loads,
+ *      preventing the kernel from handing them to another driver (spi0, spi5).
+ *   2. DOCUMENT which header pins are wired to the SSD1306.
+ *
+ * GPIO assignments (RP1 / BCM numbering — same numbering used by gpiochip4):
+ * ---------------------------------------------------------------------------
+ *   GPIO  5  → D/C  (Data / Command)             — SSD1306_DC_PIN
+ *   GPIO  6  → RST  (Hardware Reset)              — SSD1306_RST_PIN
+ *   GPIO 17  → SCLK (SPI Serial Clock)            — SPI_SCLK_PIN
+ *   GPIO 22  → CS   (Chip Select, active-low)     — SPI_CS_PIN
+ *   GPIO 27  → MOSI (Master Out Slave In)         — SPI_MOSI_PIN
+ * RP1 pinctrl notes:
+ * ------------------
+ *   The Pi 5 RP1 pinctrl driver (pinctrl-rp1.c) requires the GENERIC Linux
+ *   pinctrl binding — NOT the deprecated BCM2835-style brcm,function integers:
+ *     function = "gpio"  →  RP1 SIO mode (FUNCSEL = 5, plain software GPIO)
+ *     bias-disable       →  no pull-up / pull-down
+ *
+ * gpio-hog strategy:
+ * ------------------
+ *   Our driver is ioremap-based and is NOT a platform_driver, so a consumer
+ *   device with pinctrl-0 would never be probed and pinctrl would not apply.
+ *   gpio-hog nodes are processed by the GPIO core immediately when the GPIO
+ *   controller registers — no matching driver needed. Each hog claims the pin
+ *   from the RP1 pool and drives it to a safe idle state at boot.
+ *   ModuleInit() then takes over the lines via direct RIO register writes.
+ *
+ * Installation:
+ *   dtc -@ -I dts -O dtb -o ssd1306-bitbang.dtbo ssd1306-bitbang.dts
+ *   sudo cp ssd1306-bitbang.dtbo /boot/firmware/overlays/
+ *   # Add exactly ONE of the following to /boot/firmware/config.txt:
+ *   dtoverlay=ssd1306-bitbang
+ *
+ * Verify (after reboot):
+ *   gpioinfo gpiochip | grep ssd1306   <- expects 5 lines
+ */
+
+/ {
+    /* Restrict overlay to Raspberry Pi 5 only */
+    compatible = "raspberrypi,5-model-b", "brcm,bcm2712";
+
+    /*
+     * Single fragment targeting the RP1 GPIO controller.
+     *
+     * Merging pinctrl group + gpio-hog nodes into ONE fragment ensures the
+     * overlay loader applies them as an atomic unit — eliminating any risk
+     * of double-registration that arises when two fragments share a target.
+     */
+    fragment@0 {
+        target = <&rp1_gpio>;
+        __overlay__ {
+
+            /* ----------------------------------------------------------------
+             * Pinctrl group: defines the mux and bias for all five pins.
+             * Consumed by the gpio-hog nodes below via the standard GPIO
+             * framework — our ioremap driver ignores this entirely and sets
+             * the hardware registers directly.
+             * ---------------------------------------------------------------- */
+            ssd1306_spi_pins: ssd1306_spi_pins {
+
+                /* SCLK, MOSI, CS, MISO_LB — output, no pull */
+                data_pins {
+                    pins = "gpio16",    /* MISO_LB (loopback driver) */
+                           "gpio17",    /* SCLK */
+                           "gpio27",    /* MOSI */
+                           "gpio22";    /* CS   */
+                    function = "gpio";  /* RP1 SIO mode (FUNCSEL = 5) */
+                    bias-disable;
+                };
+
+                /* D/C, RST — output, no pull */
+                ctrl_pins {
+                    pins = "gpio5",     /* D/C */
+                           "gpio6";     /* RST */
+                    function = "gpio";
+                    bias-disable;
+                };
+            };
+
+            /* ----------------------------------------------------------------
+             * gpio-hog nodes: claim and drive each pin at boot.
+             * Idle states match the C driver's expectations in ModuleInit():
+             *   SCLK idle LOW  (CPOL = 0)
+             *   MOSI idle LOW
+             *   CS   idle HIGH (active-low — device de-selected)
+             *   D/C  idle LOW  (command mode default, dc_mode_set = true)
+             *   RST  idle LOW  (ModuleInit will pulse it HIGH to reset OLED)
+             * ---------------------------------------------------------------- */
+
+            /* GPIO 16 — MISO_LB (loopback test driver output, idle LOW) */
+            miso_lb_hog: miso_lb_hog {
+                gpio-hog;
+                gpios = <16 0>;
+                output-low;
+                line-name = "ssd1306-miso-lb";
+            };
+
+            /* GPIO 17 — SCLK */
+            sclk_hog: sclk_hog {
+                gpio-hog;
+                gpios = <17 0>;
+                output-low;
+                line-name = "ssd1306-sclk";
+            };
+
+            /* GPIO 27 — MOSI */
+            mosi_hog: mosi_hog {
+                gpio-hog;
+                gpios = <27 0>;
+                output-low;
+                line-name = "ssd1306-mosi";
+            };
+
+            /* GPIO 22 — CS (idle HIGH = de-asserted) */
+            cs_hog: cs_hog {
+                gpio-hog;
+                gpios = <22 0>;
+                output-high;
+                line-name = "ssd1306-cs";
+            };
+
+            /* GPIO 5 — D/C (idle LOW = command mode) */
+            dc_hog: dc_hog {
+                gpio-hog;
+                gpios = <5 0>;
+                output-low;
+                line-name = "ssd1306-dc";
+            };
+
+            /* GPIO 6 — RST (idle LOW; ModuleInit pulses HIGH for reset) */
+            rst_hog: rst_hog {
+                gpio-hog;
+                gpios = <6 0>;
+                output-low;
+                line-name = "ssd1306-rst";
+            };
+
+        }; /* __overlay__ */
+    }; /* fragment@0 */
+
+}; /* / */
